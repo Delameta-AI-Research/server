@@ -522,8 +522,8 @@ def stress_thread(name, seed, pass_cnt, correlation_id_base, trial, model_name,
 def check_status(model_name):
     client = grpcclient.InferenceServerClient("localhost:8001",
                                               verbose=FLAGS.verbose)
-    stats = client.get_inference_statistics(model_name)
-    print(stats)
+    # stats = client.get_inference_statistics(model_name)
+    # print(stats)
 
 
 if __name__ == '__main__':

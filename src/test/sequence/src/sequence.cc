@@ -91,8 +91,8 @@ class ModelState {
   const std::string& Name() const { return name_; }
   uint64_t Version() const { return version_; }
 
-  // Get accumulator and execution delay
-  std::vector<int32_t> Accumulator() const { return accumulator_; }
+  // Get accumulator size and execution delay
+  size_t AccumulatorSize() const { return accumulator_size_; }
   int ExecDelay() const { return execute_delay_ms_; }
 
   // Does this model support batching in the first dimension. This
@@ -125,8 +125,8 @@ class ModelState {
   // Delay to introduce into execution, in milliseconds.
   int execute_delay_ms_;
 
-  // Accumulators maintained by this context, one for each batch slot.
-  std::vector<int32_t> accumulator_;
+  // Accumulator size
+  size_t accumulator_size_;
 };
 
 TRITONSERVER_Error*
@@ -244,7 +244,7 @@ ModelState::ValidateModelConfig()
 
   int64_t max_batch_size = 0;
   RETURN_IF_ERROR(model_config_.MemberAsInt("max_batch_size", &max_batch_size));
-  accumulator_.resize(std::max((int64_t)1, max_batch_size));
+  accumulator_size_ = (size_t)(std::max((int64_t)1, max_batch_size));
 
   // The model configuration must specify the sequence batcher and
   // must use the START and READY input to indicate control values.
@@ -381,6 +381,11 @@ class ModelInstanceState {
   // Get the state of the model that corresponds to this instance.
   ModelState* StateForModel() const { return model_state_; }
 
+  // Get accumulator for this instance
+  int32_t GetAccumulatorAt(size_t idx);
+  void SetAccumulatorAt(size_t idx, int32_t value);
+  void AddAccumulatorAt(size_t idx, int32_t value);
+
  private:
   ModelInstanceState(
       ModelState* model_state,
@@ -392,6 +397,9 @@ class ModelInstanceState {
   const std::string name_;
   const TRITONSERVER_InstanceGroupKind kind_;
   const int32_t device_id_;
+
+  // Accumulators maintained by this instance, one for each batch slot.
+  std::vector<int32_t> accumulator_;
 };
 
 TRITONSERVER_Error*
@@ -424,6 +432,25 @@ ModelInstanceState::ModelInstanceState(
     : model_state_(model_state), triton_model_instance_(triton_model_instance),
       name_(name), kind_(kind), device_id_(device_id)
 {
+  accumulator_.resize(model_state->AccumulatorSize());
+}
+
+int32_t
+ModelInstanceState::GetAccumulatorAt(size_t idx)
+{
+  return accumulator_[idx];
+}
+
+void
+ModelInstanceState::SetAccumulatorAt(size_t idx, int32_t value)
+{
+  accumulator_[idx] = value;
+}
+
+void
+ModelInstanceState::AddAccumulatorAt(size_t idx, int32_t value)
+{
+  accumulator_[idx] += value;
 }
 
 /////////////
@@ -706,7 +733,7 @@ TRITONBACKEND_ModelInstanceExecute(
   // batch-size 1 inputs which is the next timestep for that
   // sequence. The total number of requests will not exceed the
   // max-batch-size specified in the model configuration.
-  if (request_count > model_state->Accumulator().size()) {
+  if (request_count > model_state->AccumulatorSize()) {
     return TRITONSERVER_ErrorNew(
         TRITONSERVER_ERROR_UNSUPPORTED,
         "unable to execute batch larger than max-batch-size");
@@ -759,6 +786,8 @@ TRITONBACKEND_ModelInstanceExecute(
     uint64_t exec_start_ns = 0;
     SET_TIMESTAMP(exec_start_ns);
     min_exec_start_ns = std::min(min_exec_start_ns, exec_start_ns);
+
+    LOG_MESSAGE(TRITONSERVER_LOG_ERROR, "processing request");
 
     TRITONBACKEND_Request* request = requests[r];
 
@@ -877,6 +906,8 @@ TRITONBACKEND_ModelInstanceExecute(
       continue;
     }
 
+    LOG_MESSAGE(TRITONSERVER_LOG_ERROR, "extract input START");
+
     TRITONBACKEND_Input* ready_input = nullptr;
     GUARDED_RESPOND_IF_ERROR(
         responses, r,
@@ -889,6 +920,8 @@ TRITONBACKEND_ModelInstanceExecute(
               .c_str());
       continue;
     }
+
+    LOG_MESSAGE(TRITONSERVER_LOG_ERROR, "extract input READY");
 
     uint64_t buffer_byte_size = 0;
     TRITONSERVER_MemoryType input_memory_type = TRITONSERVER_MEMORY_CPU;
@@ -912,6 +945,8 @@ TRITONBACKEND_ModelInstanceExecute(
       continue;
     }
 
+    LOG_MESSAGE(TRITONSERVER_LOG_ERROR, "extract start buffer");
+
     GUARDED_RESPOND_IF_ERROR(
         responses, r,
         TRITONBACKEND_InputBuffer(
@@ -930,6 +965,8 @@ TRITONBACKEND_ModelInstanceExecute(
                                       .c_str());
       continue;
     }
+
+    LOG_MESSAGE(TRITONSERVER_LOG_ERROR, "extract ready buffer");
 
     TRITONBACKEND_Input* input = nullptr;
     GUARDED_RESPOND_IF_ERROR(
@@ -965,6 +1002,8 @@ TRITONBACKEND_ModelInstanceExecute(
       continue;
     }
 
+    LOG_MESSAGE(TRITONSERVER_LOG_ERROR, "extract input INPUT");
+
     TRITONSERVER_DataType input_datatype;
     const int64_t* input_shape;
     uint32_t input_dims_count;
@@ -984,6 +1023,8 @@ TRITONBACKEND_ModelInstanceExecute(
       continue;
     }
 
+    LOG_MESSAGE(TRITONSERVER_LOG_ERROR, "extract input properties");
+
     int64_t input_element_cnt = input_byte_size / sizeof(int32_t);
 
     int32_t* start = reinterpret_cast<int32_t*>(&start_buffer[0]);
@@ -996,13 +1037,13 @@ TRITONBACKEND_ModelInstanceExecute(
       if (start[0] == 0) {
         // Update accumulator.
         for (int64_t e = 0; e < input_element_cnt; ++e) {
-          model_state->Accumulator()[r] += ipbuffer_int[e];
+          instance_state->AddAccumulatorAt(r, ipbuffer_int[e]);
         }
       } else {
         // Set accumulator.
-        model_state->Accumulator()[r] = ipbuffer_int[0];
+        instance_state->SetAccumulatorAt(r, ipbuffer_int[0]);
         for (int64_t e = 1; e < input_element_cnt; ++e) {
-          model_state->Accumulator()[r] += ipbuffer_int[e];
+          instance_state->AddAccumulatorAt(r, ipbuffer_int[e]);
         }
       }
 
@@ -1047,6 +1088,8 @@ TRITONBACKEND_ModelInstanceExecute(
           continue;
         }
 
+        LOG_MESSAGE(TRITONSERVER_LOG_ERROR, "get output buffer");
+
         // Step 2. Get the output buffer. We request a buffer in CPU
         // memory but we have to handle any returned type. If we get
         // back a buffer in GPU memory we just fail the request.
@@ -1076,9 +1119,11 @@ TRITONBACKEND_ModelInstanceExecute(
 
         int32_t* obuffer_int = reinterpret_cast<int32_t*>(output_buffer);
         for (int64_t i = 0; i < input_element_cnt; ++i) {
-          obuffer_int[i] = model_state->Accumulator()[r];
+          obuffer_int[i] = instance_state->GetAccumulatorAt(r);
         }
       }
+
+      LOG_MESSAGE(TRITONSERVER_LOG_ERROR, "set output buffer");
     }
 
     // To demonstrate response parameters we attach some here. Most responses
@@ -1105,6 +1150,8 @@ TRITONBACKEND_ModelInstanceExecute(
             nullptr /* success */),
         "failed sending response");
 
+    LOG_MESSAGE(TRITONSERVER_LOG_ERROR, "send response");
+
     uint64_t exec_end_ns = 0;
     SET_TIMESTAMP(exec_end_ns);
     max_exec_end_ns = std::max(max_exec_end_ns, exec_end_ns);
@@ -1117,7 +1164,10 @@ TRITONBACKEND_ModelInstanceExecute(
             instance_state->TritonModelInstance(), request, true /* success */,
             exec_start_ns, exec_start_ns, exec_end_ns, exec_end_ns),
         "failed reporting request statistics");
+    LOG_MESSAGE(TRITONSERVER_LOG_ERROR, "moving to next request");
   }
+
+  LOG_MESSAGE(TRITONSERVER_LOG_ERROR, "done with requests");
 
   // Done with requests...
 
@@ -1133,6 +1183,8 @@ TRITONBACKEND_ModelInstanceExecute(
           min_exec_start_ns, min_exec_start_ns, max_exec_end_ns,
           max_exec_end_ns),
       "failed reporting batch request statistics");
+
+  LOG_MESSAGE(TRITONSERVER_LOG_ERROR, "reported batch request statistics");
 
   // We could have released each request as soon as we sent the corresponding
   // response. But for clarity we just release them all here. Note that is
